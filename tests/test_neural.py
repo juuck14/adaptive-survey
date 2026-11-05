@@ -34,6 +34,39 @@ def make_predictor() -> NeuralPredictor:
     return NeuralPredictor([ChoiceNetwork(), ChoiceNetwork()])
 
 
+def test_training_defaults_match_cli_and_record_actual_optimizer_steps() -> None:
+    from adaptive_survey.cli import build_parser
+
+    defaults = TrainingConfig()
+    args = build_parser().parse_args(['train', '--data', 'unused-data', '--split', 'unused-split',
+                                     '--output', 'unused-output'])
+    assert defaults.epochs == args.epochs == 120
+    assert defaults.patience == args.patience == 30
+    assert defaults.validation_episodes == args.validation_episodes == 720
+    assert defaults.episodes_per_epoch == args.episodes == 1024
+    assert defaults.batch_size == args.batch_size == 64
+
+    tasks = make_tasks(3, identical=True)
+    train, validation = ('train-0', 'train-1'), ('validation-0',)
+    profiles = {uuid: Profile(uuid, (0.0,) * 9) for uuid in (*train, *validation)}
+    responses = {(uuid, task_id): 0 for uuid in profiles for task_id in tasks}
+    # A partial final batch must still count as an optimizer update; each member
+    # has its own cumulative counter and selected-checkpoint update count.
+    config = TrainingConfig(ensemble_size=2, epochs=3, episodes_per_epoch=5, batch_size=3,
+                            validation_episodes=3, patience=1, max_history=2, seed=17)
+    result = train_ensemble(profiles, tasks, responses, train, validation, config=config)
+    assert result.metadata['optimizer_steps_per_epoch'] == 2
+    assert result.metadata['max_optimizer_steps_per_member'] == 6
+    for member in range(2):
+        rows = [row for row in result.history if row['member'] == member]
+        assert rows[0]['optimizer_steps'] == 0
+        assert all(row['optimizer_steps'] == 2 * row['epoch'] for row in rows)
+        assert result.metadata['optimizer_steps_run'][member] == rows[-1]['optimizer_steps']
+        best_row = [row for row in rows if row['best']][-1]
+        assert result.metadata['best_optimizer_steps'][member] == best_row['optimizer_steps']
+        assert result.metadata['best_epochs'][member] == best_row['epoch']
+
+
 def test_history_order_and_identifiers_do_not_change_predictions() -> None:
     tasks = list(make_tasks().values())
     predictor = make_predictor()

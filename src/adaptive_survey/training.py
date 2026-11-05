@@ -24,13 +24,13 @@ from .schema import CONTEXTS, Observation, Profile, SurveyState, Task
 @dataclass(frozen=True)
 class TrainingConfig:
     ensemble_size: int = 5
-    epochs: int = 20
+    epochs: int = 120
     episodes_per_epoch: int = 1024
     batch_size: int = 64
-    validation_episodes: int = 256
+    validation_episodes: int = 720
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
-    patience: int = 4
+    patience: int = 30
     min_delta: float = 1e-5
     max_history: int = 14
     seed: int = 2026
@@ -251,6 +251,8 @@ def train_ensemble(
     models: list[ChoiceNetwork] = []
     bootstraps: list[dict[str, int]] = []
     best_epochs: list[int] = []
+    best_optimizer_steps: list[int] = []
+    optimizer_steps_run: list[int] = []
     for member in range(config.ensemble_size):
         member_seed = config.seed + 10_007 * (member + 1)
         rng = np.random.default_rng(member_seed)
@@ -262,9 +264,9 @@ def train_ensemble(
                                      weight_decay=config.weight_decay)
         best_loss = _evaluate(model, validation_bank, config.batch_size)
         best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
-        best_epoch, stale = 0, 0
+        best_epoch, best_step, stale, optimizer_steps = 0, 0, 0, 0
         histories.append({"member": member, "epoch": 0, "train_loss": None,
-                          "val_loss": best_loss, "best": True})
+                          "optimizer_steps": 0, "val_loss": best_loss, "best": True})
         for epoch in range(1, config.epochs + 1):
             model.train()
             total_loss = 0.0
@@ -284,16 +286,18 @@ def train_ensemble(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
+                optimizer_steps += 1
                 total_loss += float(loss.detach()) * count
                 n_completed += count
             val_loss = _evaluate(model, validation_bank, config.batch_size)
             improved = val_loss < best_loss - config.min_delta
             if improved:
-                best_loss, best_epoch, stale = val_loss, epoch, 0
+                best_loss, best_epoch, best_step, stale = val_loss, epoch, optimizer_steps, 0
                 best_state = {key: value.detach().clone() for key, value in model.state_dict().items()}
             else:
                 stale += 1
             histories.append({"member": member, "epoch": epoch,
+                              "optimizer_steps": optimizer_steps,
                               "train_loss": total_loss / n_completed,
                               "val_loss": val_loss, "best": improved})
             if stale >= config.patience:
@@ -301,6 +305,8 @@ def train_ensemble(
         model.load_state_dict(best_state)
         models.append(model)
         best_epochs.append(best_epoch)
+        best_optimizer_steps.append(best_step)
+        optimizer_steps_run.append(optimizer_steps)
     protocol_metadata = asdict(protocol_config) if is_dataclass(protocol_config) else None
     bank_pairs = {(example.state.profile.uuid, example.state.context) for example in validation_bank}
     bank_context_counts = Counter(example.state.context for example in validation_bank)
@@ -315,6 +321,12 @@ def train_ensemble(
         "bootstrap_unit": "respondent_all_contexts",
         "bootstrap_counts": bootstraps,
         "best_epochs": best_epochs,
+        "best_optimizer_steps": best_optimizer_steps,
+        "optimizer_steps_run": optimizer_steps_run,
+        "optimizer_steps_per_epoch": (config.episodes_per_epoch + config.batch_size - 1) // config.batch_size,
+        "max_optimizer_steps_per_member": config.epochs * (
+            (config.episodes_per_epoch + config.batch_size - 1) // config.batch_size
+        ),
         "history_sampling": "uniform_cardinality_with_protocol_initial_prefix",
         "validation_bank_seed": config.seed + 900_001,
         "validation_bank_episodes": len(validation_bank),

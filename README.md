@@ -104,6 +104,7 @@ Fixed는 train 응답으로 추정한 MNL Fisher information의 greedy 순위를
 - 개인 상태, 대안 속성, A/B/C/NONE 라벨, Context, 후보 set embedding을 공유 head에 넣습니다: 84→64→1. 네 효용에 softmax를 적용합니다.
 - 모델당 26,113개 파라미터, 기본 ensemble 5개입니다. Bootstrap 단위는 UUID이며 모든 Context를 함께 재표집합니다.
 - 공개 이력 길이 0..14에서 이력 밖 응답을 감독학습합니다. Target은 이력에 포함하지 않습니다. Validation bank는 고정 seed로 전체 validation cohort에서 섞어 추출하며 실제 포함 인원·범위와 hash를 기록합니다.
+- 기본 학습 상한은 120 epochs × 1,024 episodes, batch 64로 모델당 1,920 optimizer updates입니다. Validation 720 episodes와 patience 30으로 선택하고, 선택된 모델과 실제 실행의 update 수를 각각 기록합니다. 짧은 실행은 이력 사용을 거의 학습하지 못할 수 있습니다.
 - 평가 중 가중치는 동결합니다. 실제 또는 가상 답변은 immutable history에 추가되고, 가상 예측은 한 번에 batch 처리합니다.
 
 UUID·task ID는 모델 feature가 아닙니다. 현재 문항은행은 학습에서도 볼 수 있으므로 결과는 새 응답자 일반화에 관한 것입니다. 순서가 없는 generator에 맞춰 이력 순서를 사용하지 않습니다.
@@ -115,6 +116,8 @@ Weighted JS는 후보 q의 네 가상 답변을 넣었을 때 **다른 남은 �
 점수는 0부터 log(4) 사이지만 실제 generator에 대한 정확한 Bayesian 정보이득이나 test NLL 감소를 보장하지 않습니다. 일반 ensemble 간 차이를 개인 latent의 불확실성으로 취급하지도 않습니다. `weighted_js_scores(..., diagnostics=True)`로 총확률 일관성의 TV 진단을 얻을 수 있습니다.
 
 MMNL은 개인의 지속적인 랜덤 선호를 가지므로 주 개인화 환경입니다. MNL은 프로필 조건부 개인화의 대조 환경입니다. 이력·정책의 실제 효과는 Random 및 profile-only 결과와 비교해야 합니다. 작은 smoke run을 성능 향상의 증거로 보고하지 않습니다.
+
+기존 학습·검증 180/60명을 유지하고 새 응답자 300명, 학습 seed 3개 × ensemble 5개로 재실험했습니다. 같은 모델의 빈 이력→9개 응답 이력에서 NLL은 1.17134→1.12076으로 낮아졌고, 초기 답변만 바꾼 진단에서 다음 문항은 평균 52.22%의 사례에서 달라졌습니다. 예산 평균 JS−Random NLL은 −0.002275였지만 95% CI [−0.005480, +0.000660]이므로 정책 우위를 확정하지 않습니다. [설정·전체 결과·재현 명령](docs/RECHECK.md)을 참고하세요.
 
 ## 공통 MNL과 대체 예측기
 

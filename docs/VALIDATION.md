@@ -5,13 +5,15 @@ outperforms the baselines.
 
 ## Automated tests
 
-`python -m pytest -q`: **117 passed**, local Python 3.12, CPU.
+`python -m pytest -q`: **136 passed**, local Python 3.12, CPU.
 
 The suite covers input validation and duplicates, UUID splits, protected tasks,
 scenario isolation, immutable fantasies, hidden-label perturbations, context
 resets, proper choice scores, balanced paired-UUID bootstrap, MNL feature/rank
 handling, neural history learning and checkpoint round trips, command-line
-training/evaluation, and output overwrite protection.
+training/evaluation, optimizer-update accounting, preserved/fresh cohort
+construction, multi-seed aggregation, saved-history diagnostics, and output
+overwrite protection.
 
 The neural learning test uses an artificial persistent-latent problem and
 unseen UUIDs; it is a functional test of history use, not the project benchmark.
@@ -55,6 +57,51 @@ The small real-sample run produced essentially the same NLL for the four neural
 policies. It verifies execution and comparison conditions; it does not establish
 an adaptive performance gain. Full experiment tuning, response-seed repetitions,
 and graph/Bayesian comparisons remain separate research work.
+
+## Longer-training recheck
+
+The initial 12 × 512 / 64 configuration allowed only 96 optimizer updates per
+member. The recheck preserves the original training 180 and validation 60
+respondents and draws 300 new test respondents after excluding all original
+300 UUIDs. The supplied Generator produces the new test panel; original
+training/validation labels are unchanged. Completeness, preserved rows, profile
+mapping, exclusions and source/generator/model hashes were checked independently.
+
+Three training-procedure seeds each fit a five-member ensemble. The cap is
+120 × 1,024 / 64 = 1,920 updates, with a 720-episode validation bank and patience
+30. Validation selected 304–528 updates across the 15 members. Each validation
+bank covered all 60 UUIDs and 180 UUID/context pairs. Test scores did not choose
+the checkpoint, architecture, loss or training budget.
+
+Each frozen ensemble ran all four policies on all new 300 UUIDs × 3 contexts,
+with identical protected tasks, two initial questions and rollout seed. The
+primary budget-average JS − Random NLL difference was −0.002275, with paired
+UUID bootstrap 95% interval [−0.005480, +0.000660]. This does not establish a
+policy advantage. [RECHECK.md](RECHECK.md) records the complete protocol and
+results. The old and new test cohorts are not directly compared as evidence of
+a training effect.
+
+The separate same-checkpoint H0/H9 diagnostic found NLL 1.171341 → 1.120757,
+with paired UUID 95% interval for H9−H0 [−0.078295, −0.026942]. The actual
+third-question choice was reproduced before a controlled change to both
+revealed initial answers. The next question changed in 98/180, 93/180 and
+91/180 cases across seeds, using the same hash-selected 180 episodes. This
+confirms computational answer sensitivity, not true information gain.
+
+A first-pass seed-2027 trace was observed with its last 12 rows missing, despite
+complete scores and predictions. That output was preserved. Evaluation was
+repeated with the identical checkpoint, data, protocol, rollout seed and thread
+settings. The complete 32,400-row replay matched all previous query histories,
+probabilities, metric values and existing acquisition scores exactly; the
+32,388-row original matched its prefix in selection, response, candidate and
+score fields, excluding timing measurements. No learner or policy configuration
+changed.
+
+The orchestration helper was also exercised with two independent processes on
+artificial development data, including training, all four rollouts, and seed
+aggregation. Regression fixtures check analytic seed means/SD, UUID clustering,
+missing or mismatched evaluation cells, changed worlds/checkpoints/holdouts,
+saved H9 use, answer interventions, and refusal to overwrite evaluator inputs.
 
 ## Scope
 
