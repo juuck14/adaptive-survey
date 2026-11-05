@@ -1,0 +1,8 @@
+{
+  "description": "Proposed starting configuration; passed explicitly through the CLI",
+  "protocol": {"holdout_per_block": 2, "initial_per_block": 1, "budgets": [3, 5, 7, 9], "seed": 2026},
+  "respondents": {"train": 6000, "validation": 1000, "test": 2000},
+  "training": {"ensemble": 5, "epochs": 20, "episodes": 1024, "validation_episodes": 256, "batch_size": 64, "learning_rate": 0.001, "seed": 2026},
+  "evaluation": {"scenario": "mmnl", "policies": ["fixed", "random", "entropy", "weighted_js"], "bootstrap": 2000},
+  "note": "MNL is evaluated with a separately trained MNL-scenario checkpoint. The JSON is a reference, not an automatically loaded CLI config."
+}
