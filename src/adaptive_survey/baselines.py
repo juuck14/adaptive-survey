@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from dataclasses import dataclass
 import json
 from pathlib import Path
+from types import MappingProxyType
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -149,66 +151,142 @@ class PanelMAPPredictor(BasePredictor):
         return result
 
 
+@dataclass(frozen=True)
+class FixedDesignPlan:
+    context: str
+    candidate_task_ids: tuple[str, ...]
+    initial_task_ids: tuple[str, ...]
+    task_ids: tuple[str, ...]
+    prefix_log_determinants: tuple[float, ...]
+    information_rank: int
+    ridge: float
+
+
+class FixedEfficientDesign:
+    """Preplan nested, regularized local D-optimal prefixes without test answers.
+
+    MNL coefficients and the profile distribution come only from training data.
+    Each task's expected Fisher information is averaged over that distribution.
+    Plans condition on the common initial questions and the actual available
+    pool, not a full-bank ranking with unavailable tasks deleted afterwards.
+    Greedy search is an approximation, not a claim of a globally optimal design.
+    """
+
+    def __init__(self, tasks: Mapping[str, Task] | Sequence[Task],
+                 profiles: Mapping[str, Profile] | Sequence[Profile],
+                 coefficients: Sequence[float], ridge: float = 1.0,
+                 max_profiles: int = 256):
+        from .estimation import DEFAULT_FEATURE_NAMES, design_matrix
+
+        beta = np.asarray(coefficients, dtype=np.float64)
+        if beta.shape != (len(DEFAULT_FEATURE_NAMES),) or not np.all(np.isfinite(beta)):
+            raise ValueError("Coefficients must match the estimation feature map")
+        if not np.isfinite(ridge) or ridge <= 0:
+            raise ValueError("Fisher ridge must be finite and positive")
+        if type(max_profiles) is not int or max_profiles <= 0:
+            raise ValueError("max_profiles must be a positive integer")
+        people = tuple(sorted(profiles.values() if isinstance(profiles, Mapping) else profiles,
+                              key=lambda profile: profile.uuid))
+        catalog = tuple(sorted(tasks.values() if isinstance(tasks, Mapping) else tasks,
+                               key=lambda task: task.task_id))
+        if not people or not catalog:
+            raise ValueError("Training profiles and tasks must be nonempty")
+        if len({task.task_id for task in catalog}) != len(catalog):
+            raise ValueError("Task IDs must be unique")
+        if any(task.context not in CONTEXTS for task in catalog):
+            raise ValueError("Unknown task context")
+        self.training_profile_count = len(people)
+        if len(people) > max_profiles:
+            indices = np.linspace(0, len(people) - 1, max_profiles, dtype=int)
+            people = tuple(people[int(index)] for index in indices)
+        self.fisher_profile_count = len(people)
+        self.ridge = float(ridge)
+        self.tasks = MappingProxyType({task.task_id: task for task in catalog})
+        self.information_ranks: dict[str, int] = {}
+        self._information: dict[str, np.ndarray] = {}
+        self._plans: dict[tuple, FixedDesignPlan] = {}
+        fisher = {}
+        for task in catalog:
+            information = np.zeros((len(beta), len(beta)), dtype=np.float64)
+            for profile in people:
+                x = design_matrix(task, profile)
+                probabilities = softmax(x @ beta)
+                centered = x - probabilities @ x
+                information += (centered.T * probabilities) @ centered
+            fisher[task.task_id] = information / len(people)
+        for context in CONTEXTS:
+            ids = [task.task_id for task in catalog if task.context == context]
+            if not ids:
+                continue
+            # Use one context-wide basis, fixed before any masked pool is seen.
+            # Structurally unsupported directions are excluded from the criterion.
+            full_information = sum((fisher[task_id] for task_id in ids), np.zeros_like(information))
+            values, vectors = np.linalg.eigh(full_information)
+            tolerance = len(beta) * np.finfo(float).eps * max(float(values[-1]), 1.0)
+            basis = vectors[:, values > tolerance]
+            if not basis.shape[1]:
+                raise ValueError(f"No supported Fisher information directions in {context}")
+            self.information_ranks[context] = basis.shape[1]
+            for task_id in ids:
+                projected = basis.T @ fisher[task_id] @ basis
+                self._information[task_id] = (projected + projected.T) / 2
+
+    @staticmethod
+    def _logdet(precision: np.ndarray) -> float:
+        sign, value = np.linalg.slogdet(precision)
+        if sign <= 0 or not np.isfinite(value):
+            raise ValueError("Regularized Fisher matrix must be positive definite")
+        return float(value)
+
+    def plan(self, context: str, candidates: Sequence[Task],
+             initial: Sequence[Task] = ()) -> FixedDesignPlan:
+        ids = tuple(sorted(task.task_id for task in candidates))
+        initials = tuple(task.task_id for task in initial)
+        if not ids or len(set(ids)) != len(ids) or len(set(initials)) != len(initials):
+            raise ValueError("Fixed design needs unique candidate and initial tasks")
+        if not set(initials) <= set(ids):
+            raise ValueError("Fixed initial questions must belong to the candidate pool")
+        if any(self.tasks.get(task.task_id) != task or task.context != context
+               for task in (*candidates, *initial)):
+            raise ValueError("Fixed plan tasks must match the public context catalog")
+        key = (context, ids, initials)
+        if key in self._plans:
+            return self._plans[key]
+        rank = self.information_ranks[context]
+        precision = self.ridge * np.eye(rank)
+        order, logdets = [], []
+        for task_id in initials:
+            precision += self._information[task_id]
+            order.append(task_id)
+            logdets.append(self._logdet(precision))
+        remaining = [task_id for task_id in ids if task_id not in set(initials)]
+        while remaining:
+            scores = [self._logdet(precision + self._information[task_id]) for task_id in remaining]
+            maximum = max(scores)
+            index = next(i for i, score in enumerate(scores) if score >= maximum - 1e-12)
+            task_id = remaining.pop(index)
+            precision += self._information[task_id]
+            order.append(task_id)
+            logdets.append(scores[index])
+        plan = FixedDesignPlan(context, ids, initials, tuple(order), tuple(logdets), rank, self.ridge)
+        self._plans[key] = plan
+        return plan
+
+    def metadata(self) -> dict:
+        return {"criterion": "training-profile mean Fisher; regularized local D-optimal greedy",
+                "ridge": self.ridge, "information_ranks": dict(self.information_ranks),
+                "training_profiles": self.training_profile_count,
+                "fisher_profiles": self.fisher_profile_count,
+                "conditioning": "common initial tasks and actual candidate pool; no test choices",
+                "nested_prefixes": True, "globally_optimal": False}
+
+
 def greedy_fisher_rankings(tasks: Mapping[str, Task] | Sequence[Task],
                            profiles: Mapping[str, Profile] | Sequence[Profile],
                            coefficients: Sequence[float], ridge: float = 1.0,
                            max_profiles: int = 256) -> dict[str, list[str]]:
-    """Preplan greedy log-det rankings from train-profile average MNL Fisher.
-
-    This uses an estimated population coefficient vector. It does not claim
-    the original task bank's design efficiency or access generator parameters.
-    """
-    from .estimation import DEFAULT_FEATURE_NAMES, design_matrix
-
-    beta = np.asarray(coefficients, dtype=np.float64)
-    if beta.shape != (len(DEFAULT_FEATURE_NAMES),) or not np.all(np.isfinite(beta)):
-        raise ValueError("Coefficients must match the estimation feature map")
-    if not np.isfinite(ridge) or ridge <= 0:
-        raise ValueError("Fisher ridge must be finite and positive")
-    if not isinstance(max_profiles, int) or max_profiles <= 0:
-        raise ValueError("max_profiles must be a positive integer")
-    profile_values = profiles.values() if isinstance(profiles, Mapping) else profiles
-    task_values = tasks.values() if isinstance(tasks, Mapping) else tasks
-    profiles = tuple(sorted(profile_values, key=lambda profile: profile.uuid))
-    tasks = tuple(sorted(task_values, key=lambda task: task.task_id))
-    if not profiles or not tasks:
-        raise ValueError("Training profiles and tasks must be nonempty")
-    if len({task.task_id for task in tasks}) != len(tasks):
-        raise ValueError("Task IDs must be unique")
-    if any(task.context not in CONTEXTS for task in tasks):
-        raise ValueError("Unknown task context")
-    if len(profiles) > max_profiles:
-        indices = np.linspace(0, len(profiles) - 1, max_profiles, dtype=int)
-        profiles = tuple(profiles[int(index)] for index in indices)
-
-    fisher: dict[str, np.ndarray] = {}
-    for task in tasks:
-        information = np.zeros((len(beta), len(beta)), dtype=np.float64)
-        for profile in profiles:
-            x = np.asarray(design_matrix(task, profile), dtype=np.float64)
-            probabilities = softmax(x @ beta)
-            centered = x - probabilities @ x
-            information += (centered.T * probabilities) @ centered
-        fisher[task.task_id] = information / len(profiles)
-
-    rankings: dict[str, list[str]] = {}
-    for context in CONTEXTS:
-        remaining = [task.task_id for task in tasks if task.context == context]
-        if not remaining:
-            continue
-        precision = ridge * np.eye(len(beta))
-        ranking: list[str] = []
-        while remaining:
-            gains = []
-            for task_id in remaining:
-                sign, logdet = np.linalg.slogdet(precision + fisher[task_id])
-                if sign <= 0 or not np.isfinite(logdet):
-                    raise ValueError("Regularized Fisher matrix must be positive definite")
-                gains.append(float(logdet))
-            maximum = max(gains)
-            index = next(index for index, gain in enumerate(gains) if gain >= maximum - 1e-12)
-            task_id = remaining.pop(index)
-            ranking.append(task_id)
-            precision = precision + fisher[task_id]
-        rankings[context] = ranking
-    return rankings
+    """Convenience full-bank plans; evaluation uses pool-conditioned plans."""
+    design = FixedEfficientDesign(tasks, profiles, coefficients, ridge, max_profiles)
+    return {context: list(design.plan(context, tuple(task for task in design.tasks.values()
+                                                   if task.context == context)).task_ids)
+            for context in design.information_ranks}

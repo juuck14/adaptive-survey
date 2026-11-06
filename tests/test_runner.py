@@ -57,7 +57,7 @@ PROFILE = Profile("respondent", (0.0,) * 9)
 
 def test_common_readout_equal_at_zero_initial_and_full_pool():
     tasks = tasks_for()
-    config = ProtocolConfig(budgets=(0, 2, 3, 9, 14))
+    config = ProtocolConfig(initial_per_block=1, budgets=(0, 2, 3, 9, 14))
     episode = make_episode(PROFILE, "transfer", tasks, config)
     results = [run_episode(PROFILE, "transfer", World(tasks), episode,
                            PublicPredictor(), RankedPolicy(reverse), PublicPredictor())
@@ -90,7 +90,7 @@ def test_hidden_response_intervention_cannot_change_rollout_or_predictions(tmp_p
 def test_personal_state_resets_across_contexts_and_people():
     tasks = tasks_for() + tasks_for("layover")
     profiles = {PROFILE.uuid: PROFILE, "other": Profile("other", PROFILE.features)}
-    config = ProtocolConfig(budgets=(0, 2))
+    config = ProtocolConfig(initial_per_block=1, budgets=(0, 2))
     episodes = [make_episode(profiles[uuid], context, tasks, config)
                 for uuid, context in ((PROFILE.uuid, "transfer"), (PROFILE.uuid, "layover"), ("other", "transfer"))]
     result = run_survey(profiles, episodes, World(tasks), PublicPredictor(), RankedPolicy())
@@ -101,7 +101,7 @@ def test_personal_state_resets_across_contexts_and_people():
 
 def test_illegal_policy_query_and_nonfinite_scores_rejected():
     tasks = tasks_for()
-    episode = make_episode(PROFILE, "transfer", tasks, ProtocolConfig(budgets=(3,)))
+    episode = make_episode(PROFILE, "transfer", tasks, ProtocolConfig(initial_per_block=1, budgets=(3,)))
 
     class Illegal:
         name = "illegal"
@@ -119,9 +119,27 @@ def test_scenario_specific_world_never_uses_other_generator_column():
     mnl = {(PROFILE.uuid, t.task_id): 0 for t in tasks}
     mmnl = {(PROFILE.uuid, t.task_id): 3 for t in tasks}
     bundle = DataBundle({PROFILE.uuid: PROFILE}, mapping, {"mnl": mnl, "mmnl": mmnl})
-    episode = make_episode(PROFILE, "transfer", tasks, ProtocolConfig(budgets=(2,)))
+    episode = make_episode(PROFILE, "transfer", tasks, ProtocolConfig(initial_per_block=1, budgets=(2,)))
     for scenario, expected in (("mnl", 0), ("mmnl", 3)):
         result = run_episode(PROFILE, "transfer", ResponseWorld(bundle, scenario), episode,
                              PublicPredictor(), RankedPolicy())
         assert {o.choice for o in result.observations} == {expected}
         assert {c.scenario for c in result.checkpoints} == {scenario}
+
+
+def test_preference_trajectory_collects_eighteen_without_scoring_revealed_answers():
+    tasks = tasks_for()
+    episode = make_episode(PROFILE, "transfer", tasks, track="preference")
+    world = World(tasks)
+    # The scoring path must not request any label when no holdout exists.
+    def forbidden(*args):
+        raise AssertionError("preference collection cannot read prediction labels")
+    world.answer = forbidden
+    result = run_episode(PROFILE, "transfer", world, episode, PublicPredictor(), RankedPolicy())
+    assert [cp.budget for cp in result.checkpoints] == [6, 9, 12, 15, 18]
+    assert len(result.trace) == len({row.task_id for row in result.trace}) == 18
+    assert sum(row.initial for row in result.trace) == 4
+    for cp in result.checkpoints:
+        assert cp.track == "preference"
+        assert not cp.probabilities and not cp.holdout_task_ids
+        assert score_checkpoint(cp, world) == ()

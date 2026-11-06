@@ -14,7 +14,7 @@ from typing import Any
 
 from . import __version__
 from .data import load_bundle, load_profiles, load_tasks, ResponseWorld, validate_response_csv
-from .protocol import ProtocolConfig, make_episode, split_uuids
+from .protocol import DEFAULT_BUDGETS, TRACKS, ProtocolConfig, make_episode, split_uuids
 from .schema import CONTEXTS
 
 
@@ -116,7 +116,9 @@ def command_split(args):
     profiles, tasks = load_profiles(p), load_tasks(t)
     report = validate_response_csv(r, tasks, profiles)
     groups = split_uuids(_cohort(r), args.train, args.validation, args.test, seed=args.seed)
-    protocol = ProtocolConfig(seed=args.seed, budgets=tuple(args.budgets))
+    protocol = ProtocolConfig(seed=args.seed, budgets=tuple(args.budgets),
+                              initial_per_block=args.initial_per_block,
+                              holdout_per_block=args.holdout_per_block)
     if Path(args.output).exists():
         raise FileExistsError("Split manifest exists; choose a new output")
     value = {"schema_version": 1, "version": __version__, "uuids": groups,
@@ -135,7 +137,8 @@ def command_train(args):
     config = TrainingConfig(ensemble_size=args.ensemble, epochs=args.epochs,
                             episodes_per_epoch=args.episodes, validation_episodes=args.validation_episodes,
                             batch_size=args.batch_size, learning_rate=args.learning_rate,
-                            patience=args.patience, seed=args.seed, num_threads=args.threads)
+                            patience=args.patience, max_history=args.max_history,
+                            seed=args.seed, num_threads=args.threads)
     started = perf_counter()
     result = train_ensemble(bundle.profiles, bundle.tasks, bundle.responses[args.scenario],
                             split["uuids"]["train"], split["uuids"]["validation"],
@@ -194,7 +197,7 @@ def _predictor(kind: str, checkpoint: str | None, split: dict, scenario: str):
 
 
 def command_evaluate(args):
-    from .baselines import greedy_fisher_rankings
+    from .baselines import FixedEfficientDesign
     from .estimation import fit_pooled_mnl
     from .metrics import paired_uuid_bootstrap, score_checkpoint, summarize_scores
     from .policies import make_policy
@@ -219,31 +222,70 @@ def command_evaluate(args):
         raise ValueError("Evaluation split is empty")
     if len(set(args.policies)) != len(args.policies):
         raise ValueError("Policies must be unique")
-    if len(set(args.contexts)) != len(args.contexts):
-        raise ValueError("Contexts must be unique")
-    rankings, fixed_fit = None, None
+    if len(set(args.contexts)) != len(args.contexts) or len(set(args.tracks)) != len(args.tracks):
+        raise ValueError("Contexts and tracks must be unique")
+    tracks = {}
+    for track in args.tracks:
+        budgets = config.budgets_for(track)
+        tracks[track] = {"budgets": list(budgets),
+                         "unavailable_budgets": sorted(set(config.budgets) - set(budgets)),
+                         "candidate_count": 18 - 2 * config.holdout_per_block if track == "prediction" else 18,
+                         "holdout_count": 2 * config.holdout_per_block if track == "prediction" else 0,
+                         "status": "completed" if budgets else "no_feasible_budgets"}
+        if track == "prediction":
+            tracks[track]["unavailable_reason"] = "Held-out tasks must remain unasked; no NLL is computed at unavailable budgets"
+    prepared = {track: [make_episode(uid, context, bundle.tasks, config, track=track)
+                        for uid in ids for context in args.contexts]
+                for track, settings in tracks.items() if settings["budgets"]}
+    if not prepared:
+        raise ValueError("No feasible budgets in the requested evaluation tracks")
+    design, fixed_fit = None, None
+    planning_timing = None
     if "fixed" in args.policies:
         # This prior uses training answers only, not a generator model file.
+        started = perf_counter()
         fixed_fit = fit_pooled_mnl(_records(bundle, split["uuids"]["train"], args.scenario),
                                   drop_unidentified=True)
         if not fixed_fit.converged:
             raise ValueError("Training-only fixed-design prior did not converge")
-        rankings = greedy_fisher_rankings(list(bundle.tasks.values()), [bundle.profiles[u] for u in split["uuids"]["train"]],
-                                          fixed_fit.coefficients)
+        planning_timing = {"training_prior_seconds": perf_counter() - started}
+        started = perf_counter()
+        design = FixedEfficientDesign(bundle.tasks, [bundle.profiles[u] for u in split["uuids"]["train"]],
+                                      fixed_fit.coefficients, ridge=args.fixed_ridge,
+                                      max_profiles=args.fixed_max_profiles)
+        planning_timing["fisher_information_seconds"] = perf_counter() - started
+    # Preplan before any test response is revealed. Different public masks may
+    # require different fixed plans; none depend on a personal feature or answer.
+    plans, episode_plans = {}, {}
+    if design is not None:
+        started = perf_counter()
+        for track, episodes in prepared.items():
+            for episode in episodes:
+                plan = design.plan(episode.context, episode.candidates, episode.initial)
+                payload = asdict(plan)
+                plan_id = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+                plans[plan_id] = payload
+                episode_plans[(track, episode.uuid, episode.context)] = plan_id
+        planning_timing["fixed_plans_seconds"] = perf_counter() - started
+        planning_timing["unique_plans"] = len(plans)
     world = ResponseWorld(bundle, args.scenario)
     out.mkdir(parents=True, exist_ok=False)
     scored, time_totals = [], {}
-    with (out / "traces.jsonl").open("x", encoding="utf-8") as traces, (out / "predictions.jsonl").open("x", encoding="utf-8") as preds:
+    with ((out / "traces.jsonl").open("x", encoding="utf-8") as traces,
+          (out / "predictions.jsonl").open("x", encoding="utf-8") as preds,
+          (out / "collections.jsonl").open("x", encoding="utf-8") as collections):
         for policy_name in args.policies:
-            policy = make_policy(policy_name, rankings=rankings)
             seconds, steps = 0.0, 0
             prediction_seconds, common_prediction_seconds = 0.0, 0.0
-            for uid in ids:
-                for context in args.contexts:
-                    # Identical initial tasks across policies; no response-dependent setup.
-                    episode = make_episode(uid, context, bundle.tasks, config)
-                    result = run_episode(bundle.profiles[uid], context, world, episode, predictor,
-                                         policy, common, seed=args.seed, budgets=config.budgets)
+            for track, episodes in prepared.items():
+                for episode in episodes:
+                    ranking = None
+                    if design is not None and policy_name == "fixed":
+                        plan_id = episode_plans[(track, episode.uuid, episode.context)]
+                        ranking = plans[plan_id]["task_ids"]
+                    policy = make_policy(policy_name, rankings=ranking)
+                    result = run_episode(bundle.profiles[episode.uuid], episode.context, world, episode, predictor,
+                                         policy, common, seed=args.seed)
                     for row in result.trace:
                         traces.write(json.dumps(asdict(row), allow_nan=False) + "\n")
                         seconds += row.selection_seconds + row.update_seconds
@@ -251,20 +293,22 @@ def command_evaluate(args):
                     for cp in result.checkpoints:
                         prediction_seconds += cp.prediction_seconds
                         common_prediction_seconds += cp.common_prediction_seconds
-                        preds.write(json.dumps(asdict(cp), allow_nan=False) + "\n")
+                        stream = preds if track == "prediction" else collections
+                        stream.write(json.dumps(asdict(cp), allow_nan=False) + "\n")
                         scored.extend(score_checkpoint(cp, world))
             time_totals[policy_name] = {"selection_and_update_seconds": seconds, "revealed_steps": steps,
                                        "prediction_seconds": prediction_seconds,
                                        "common_prediction_seconds": common_prediction_seconds}
     summary = summarize_scores(scored)
     comparisons = []
-    main_budgets = {3, 5, 7, 9} & set(config.budgets)
-    if "random" in args.policies and main_budgets:
+    main_budgets = set(tracks.get("prediction", {}).get("budgets", []))
+    reference = "fixed" if "fixed" in args.policies else "random" if "random" in args.policies else None
+    if reference and main_budgets:
         selected = [r for r in scored if r.budget in main_budgets]
         for reader in ("native", "common") if common else ("native",):
             for name in args.policies:
-                if name != "random":
-                    comparisons.append(paired_uuid_bootstrap(selected, name, "random", reader=reader,
+                if name != reference:
+                    comparisons.append(paired_uuid_bootstrap(selected, name, reference, reader=reader,
                                        scenario=args.scenario, n_bootstrap=args.bootstrap, seed=args.seed))
     averages = []
     for policy in args.policies:
@@ -275,11 +319,16 @@ def command_evaluate(args):
                 averages.append({"policy": policy, "reader": reader, "budgets": sorted(main_budgets),
                                  "mean_nll": sum(values) / len(values)})
     _json(out / "scores.json", [asdict(s) for s in scored])
-    result = {"schema_version": 1, "version": __version__, "scenario": args.scenario,
+    if design is not None:
+        _json(out / "fixed-plans.json", {"plans": plans,
+              "episode_plans": [{"track": track, "uuid": uid, "context": context, "plan_id": plan_id}
+                                for (track, uid, context), plan_id in episode_plans.items()]})
+    result = {"schema_version": 2, "version": __version__, "scenario": args.scenario,
               "predictor": args.predictor, "protocol": asdict(config), "n_uuids": len(ids),
               "rollout_seed": args.seed, "bootstrap_seed": args.seed,
               "n_bootstrap": args.bootstrap, "policies": args.policies, "limit": args.limit,
-              "runtime": _runtime(),
+              "runtime": _runtime(), "tracks": tracks,
+              "learner_comparison": "the same frozen choice learner and checkpoint for every selection policy",
               "contexts": args.contexts, "split_hash": _split_hash(split), "fingerprints": split["fingerprints"],
               "checkpoint_sha256": _hash(args.checkpoint) if args.checkpoint else None,
               "common_checkpoint_sha256": _hash(args.common_checkpoint) if common else None,
@@ -287,11 +336,13 @@ def command_evaluate(args):
                   not args.checkpoint or _hash(args.common_checkpoint) != _hash(args.checkpoint)),
               "metrics": summary, "budget_average": averages, "paired_comparisons": comparisons,
               "fixed_prior": fixed_fit.as_dict() if fixed_fit else None,
-              "fixed_rankings": rankings,
-              "timing": time_totals, "fixed_design": "training-prior greedy ranking filtered by holdout; not the original efficient block",
+              "fixed_plans_sha256": _hash(out / "fixed-plans.json") if design is not None else None,
+              "timing": time_totals, "fixed_planning_timing": planning_timing,
+              "fixed_design": design.metadata() if design is not None else None,
               "scope": "new respondents, known task bank; one fixed response realization"}
     _json(out / "summary.json", result)
-    print(json.dumps({"output": str(out), "n_uuids": len(ids), "budget_average": averages}, allow_nan=False))
+    print(json.dumps({"output": str(out), "n_uuids": len(ids), "tracks": tracks,
+                      "budget_average": averages}, allow_nan=False))
 
 
 def command_generate(args):
@@ -314,12 +365,24 @@ def command_estimate(args):
     summary = json.loads((root / "summary.json").read_text())
     if summary["split_hash"] != _split_hash(split) or summary["fingerprints"] != split["fingerprints"]:
         raise ValueError("Evaluation and population-analysis data/splits differ")
+    config = _protocol(summary)
+    if any(summary["protocol"].get(key) != split["protocol"].get(key)
+           for key in ("seed", "holdout_per_block", "initial_per_block")):
+        raise ValueError("Evaluation and population-analysis history protocols differ")
+    track = args.track or ("preference" if summary.get("tracks", {}).get("preference", {}).get("budgets") else "prediction")
+    track_budgets = summary.get("tracks", {}).get(track, {}).get("budgets", [])
+    if not summary.get("tracks") and track == "prediction":
+        track_budgets = summary["protocol"]["budgets"]
+    if not track_budgets:
+        raise ValueError("Requested population-analysis track has no collected trajectories")
     if Path(args.output).exists():
         raise FileExistsError("Analysis output exists; choose a new path")
     grouped = {}
     with (root / "traces.jsonl").open(encoding="utf-8") as stream:
         for line in stream:
             row = json.loads(line)
+            if row.get("track", "prediction") != track:
+                continue
             key = (row["policy"], row["uuid"], row["context"])
             grouped.setdefault(key, []).append(row)
     results = []
@@ -338,15 +401,15 @@ def command_estimate(args):
                 raise ValueError("Trace UUID/context is not part of this evaluation")
             if [r["step"] for r in rows] != list(range(1, len(rows) + 1)):
                 raise ValueError("Trace has duplicated or missing steps")
-            if len(rows) != max(summary["protocol"]["budgets"]) or len({r["task_id"] for r in rows}) != len(rows):
+            if len(rows) != max(track_budgets) or len({r["task_id"] for r in rows}) != len(rows):
                 raise ValueError("Trace must contain a complete trajectory of unique questions")
-            episode = make_episode(uid, context, bundle.tasks, _protocol(split))
+            episode = make_episode(uid, context, bundle.tasks, config, track=track)
             if any(r["scenario"] != scenario or r["task_id"] not in episode.acquisition_ids
                    or bundle.responses[scenario][(uid, r["task_id"])] != r["choice"] for r in rows):
                 raise ValueError("Trace and hidden response environment disagree")
             full.extend(ChoiceRecord(bundle.profiles[uid], task, bundle.responses[scenario][(uid, task.task_id)])
                         for task in bundle.tasks.values() if task.context == context)
-        for budget in args.budgets or summary["protocol"]["budgets"]:
+        for budget in args.budgets or track_budgets:
             if budget <= 0 or any(len(rows) < budget for rows in groups.values()):
                 raise ValueError("Population budget needs collected responses for every episode")
             selected = [ChoiceRecord(bundle.profiles[uid], bundle.tasks[row["task_id"]], row["choice"])
@@ -354,7 +417,7 @@ def command_estimate(args):
             comparison = fit_selected_vs_full(selected, full, drop_unidentified=True,
                                                cluster_se=args.cluster_se, l2=args.l2)
             results.append({"policy": policy, "budget": budget, **comparison})
-    value = {"schema_version": 1, "scenario": scenario, "results": results,
+    value = {"schema_version": 2, "scenario": scenario, "track": track, "results": results,
              "evaluation_summary_sha256": _hash(root / "summary.json"), "runtime": _runtime(),
              "interpretation": "uniform-task full-survey MNL reference agreement; not MMNL parameter recovery"}
     _json(args.output, value)
@@ -374,7 +437,10 @@ def build_parser() -> argparse.ArgumentParser:
     split.add_argument("--data", required=True); split.add_argument("--output", required=True)
     split.add_argument("--train", type=int, required=True); split.add_argument("--validation", type=int, required=True)
     split.add_argument("--test", type=int, required=True); split.add_argument("--seed", type=int, default=2026)
-    split.add_argument("--budgets", type=int, nargs="+", default=[3,5,7,9]); split.set_defaults(func=command_split)
+    split.add_argument("--budgets", type=int, nargs="+", default=list(DEFAULT_BUDGETS))
+    split.add_argument("--initial-per-block", type=int, default=2)
+    split.add_argument("--holdout-per-block", type=int, default=2)
+    split.set_defaults(func=command_split)
     train = sub.add_parser("train", help="Fit the history-conditioned Non-graph ensemble")
     for name in ("data", "split", "output"): train.add_argument("--"+name, required=True)
     train.add_argument("--scenario", choices=["mnl","mmnl"], default="mmnl")
@@ -382,6 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--episodes", type=int, default=1024); train.add_argument("--validation-episodes", type=int, default=720)
     train.add_argument("--batch-size", type=int, default=64); train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--patience", type=int, default=30); train.add_argument("--seed", type=int, default=2026)
+    train.add_argument("--max-history", type=int, default=17)
     train.add_argument("--threads", type=int, default=1); train.set_defaults(func=command_train)
     baseline = sub.add_parser("fit-baseline", help="Fit a training-only panel MAP readout")
     for name in ("data", "split", "output"): baseline.add_argument("--"+name, required=True)
@@ -392,7 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--predictor", choices=["non_graph","panel_map","uniform"], default="non_graph")
     evaluate.add_argument("--checkpoint"); evaluate.add_argument("--common-checkpoint")
     evaluate.add_argument("--scenario", choices=["mnl","mmnl"], default="mmnl")
-    evaluate.add_argument("--policies", nargs="+", choices=["fixed","random","entropy","weighted_js"], default=["fixed","random","entropy","weighted_js"])
+    evaluate.add_argument("--policies", nargs="+", choices=["fixed","random","entropy","weighted_js"], default=["fixed","weighted_js"])
+    evaluate.add_argument("--tracks", nargs="+", choices=list(TRACKS), default=list(TRACKS))
+    evaluate.add_argument("--fixed-ridge", type=float, default=1.0)
+    evaluate.add_argument("--fixed-max-profiles", type=int, default=256)
     evaluate.add_argument("--contexts", nargs="+", choices=list(CONTEXTS), default=list(CONTEXTS))
     evaluate.add_argument("--budgets", nargs="+", type=int); evaluate.add_argument("--limit", type=int)
     evaluate.add_argument("--bootstrap", type=int, default=2000); evaluate.add_argument("--seed", type=int, default=2026)
@@ -404,6 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     estimate = sub.add_parser("estimate", help="Offline pooled-MNL full-survey reference analysis")
     for name in ("data", "split", "evaluation", "output"): estimate.add_argument("--"+name, required=True)
     estimate.add_argument("--policies", nargs="+"); estimate.add_argument("--budgets", nargs="+", type=int)
+    estimate.add_argument("--track", choices=list(TRACKS))
     estimate.add_argument("--l2", type=float, default=1e-4); estimate.add_argument("--cluster-se", action="store_true")
     estimate.set_defaults(func=command_estimate)
     return parser

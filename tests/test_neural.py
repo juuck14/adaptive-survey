@@ -163,8 +163,21 @@ def test_training_histories_obey_uuid_protocol_holdout() -> None:
             assert not history_ids & target_ids
             assert history_ids | target_ids == set(tasks)
             assert held_ids <= target_ids
-            if size >= 2:
+            if size >= 4:
                 assert {task.task_id for task in episode.initial} <= history_ids
+
+
+def test_shared_training_includes_separate_long_full_pool_histories() -> None:
+    tasks = make_tasks(18)
+    profiles = {"train": Profile("train", (0.0,) * 9)}
+    responses = {("train", task_id): i % 4 for i, task_id in enumerate(tasks)}
+    specs = _build_specs(profiles, tasks, responses, ("train",), ProtocolConfig(), None, None)["train"]
+    assert {spec.track for spec in specs} == {"prediction", "preference"}
+    preference = next(spec for spec in specs if spec.track == "preference")
+    example = _sample_example(preference, np.random.default_rng(8), TrainingConfig().max_history, history_size=17)
+    assert len(example.state.history) == 17 and len(example.targets) == 1
+    assert not {o.task.task_id for o in example.state.history} & {t.task_id for t in example.targets}
+    assert {t.task_id for t in preference.initial_tasks} <= {o.task.task_id for o in example.state.history}
 
 
 def test_validation_bank_samples_whole_cohort_reproducibly() -> None:

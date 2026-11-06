@@ -32,7 +32,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     patience: int = 30
     min_delta: float = 1e-5
-    max_history: int = 14
+    max_history: int = 17
     seed: int = 2026
     num_threads: int = 1
 
@@ -41,8 +41,8 @@ class TrainingConfig:
                       "validation_episodes", "patience", "num_threads"):
             if getattr(self, field) < 1:
                 raise ValueError(f"{field} must be positive")
-        if not 0 <= self.max_history <= 14:
-            raise ValueError("max_history must be between zero and fourteen")
+        if not 0 <= self.max_history <= 17:
+            raise ValueError("max_history must be between zero and seventeen")
         if self.learning_rate <= 0 or self.weight_decay < 0 or self.min_delta < 0:
             raise ValueError("Invalid optimizer/early-stopping parameters")
 
@@ -62,6 +62,7 @@ class _EpisodeSpec:
     candidate_tasks: tuple[Task, ...]
     initial_tasks: tuple[Task, ...]
     choices: Mapping[str, int]
+    track: str = "standalone"
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,7 @@ class _Example:
     state: SurveyState
     targets: tuple[Task, ...]
     labels: tuple[int, ...]
+    track: str = "standalone"
 
 
 def _ids(values: Sequence[Task | str], tasks: Mapping[str, Task]) -> tuple[Task, ...]:
@@ -108,9 +110,16 @@ def _build_specs(
                     raise ValueError(f"Invalid choice for {key}")
                 choices[task.task_id] = int(value)
             if protocol_config is not None:
-                episode = make_episode(profiles[uuid], context, tasks, protocol_config)
-                candidates = _ids(episode.candidates, tasks)
-                initials = _ids(episode.initial, tasks)
+                # Each track is a separate episode. Prediction holdout labels
+                # never become history inputs in that track. Full-pool histories
+                # belong only to the separate preference-collection track.
+                for track in ("prediction", "preference"):
+                    if not protocol_config.budgets_for(track):
+                        continue
+                    episode = make_episode(profiles[uuid], context, tasks, protocol_config, track=track)
+                    specs.append(_EpisodeSpec(profiles[uuid], context, context_tasks,
+                                              episode.candidates, episode.initial, choices, track))
+                continue
             else:
                 candidates = _ids(candidate_task_ids[context], tasks) if candidate_task_ids else context_tasks
                 initials = _ids(initial_task_ids.get(context, ()), tasks) if initial_task_ids else ()
@@ -149,7 +158,7 @@ def _sample_example(spec: _EpisodeSpec, rng: np.random.Generator, max_history: i
         Observation(task, spec.choices[task.task_id]) for task in initial
     ))
     targets = tuple(task for task in spec.all_tasks if task.task_id not in seen)
-    return _Example(state, targets, tuple(spec.choices[task.task_id] for task in targets))
+    return _Example(state, targets, tuple(spec.choices[task.task_id] for task in targets), spec.track)
 
 
 def _make_validation_bank(specs: Sequence[_EpisodeSpec], n_episodes: int,
@@ -162,7 +171,7 @@ def _make_validation_bank(specs: Sequence[_EpisodeSpec], n_episodes: int,
     """
     if not specs or n_episodes < 1:
         raise ValueError("The validation bank needs specs and a positive size")
-    ordered = sorted(specs, key=lambda spec: (spec.profile.uuid, spec.context))
+    ordered = sorted(specs, key=lambda spec: (spec.profile.uuid, spec.context, spec.track))
     rng = np.random.default_rng(seed)
     bank: list[_Example] = []
     while len(bank) < n_episodes:
@@ -177,6 +186,7 @@ def _validation_bank_hash(bank: Sequence[_Example]) -> str:
     payload = [{
         "uuid": example.state.profile.uuid,
         "context": example.state.context,
+        "track": example.track,
         "history": [(item.task.task_id, item.choice) for item in example.state.history],
         "targets": [(task.task_id, choice) for task, choice in zip(example.targets, example.labels)],
     } for example in bank]
@@ -223,11 +233,13 @@ def train_ensemble(
     """Train offline; UUID bootstraps keep all three contexts in one cluster.
 
     Pass ``protocol_config`` to use each respondent's evaluation-compatible
-    holdout/initial split. Training respondents' holdout-labelled tasks remain
-    supervised targets, but never history inputs. Validation labels are used only
+    holdout/initial split for prediction and full-pool preference episodes.
+    Training respondents' prediction holdout-labelled tasks remain supervised
+    targets, never history inputs in prediction episodes. Validation labels are used only
     for a fixed-bank NLL and early stopping. Test UUIDs must be absent from both
     supplied splits. Policy-rollout history augmentation is deliberately deferred;
-    this version uses uniform history cardinalities 0..14.
+    this version uses uniform history cardinalities up to 14 in prediction
+    episodes and 17 in preference episodes, with a shared learner.
     """
     config = config or TrainingConfig()
     train_uuids = tuple(train_uuids)
@@ -333,6 +345,8 @@ def train_ensemble(
         "validation_bank_respondents": len({uuid for uuid, _ in bank_pairs}),
         "validation_bank_respondent_context_pairs": len(bank_pairs),
         "validation_bank_context_counts": {context: bank_context_counts[context] for context in CONTEXTS},
+        "training_tracks": sorted({spec.track for row in specs.values() for spec in row}),
+        "validation_bank_track_counts": dict(Counter(example.track for example in validation_bank)),
         "validation_bank_context_respondents": {
             context: len({uuid for uuid, current in bank_pairs if current == context})
             for context in CONTEXTS

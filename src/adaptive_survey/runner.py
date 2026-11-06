@@ -27,6 +27,7 @@ class StepTrace:
     scores: Mapping[str, float]
     selection_seconds: float
     update_seconds: float
+    track: str = "prediction"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +43,7 @@ class Checkpoint:
     common_probabilities: tuple[tuple[float, ...], ...] | None = None
     prediction_seconds: float = 0.0
     common_prediction_seconds: float = 0.0
+    track: str = "prediction"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -91,8 +93,13 @@ def run_episode(
     holdout_ids = tuple(t.task_id for t in holdout)
     if len(set(candidate_ids)) != len(candidates) or len(set(holdout_ids)) != len(holdout):
         raise ValueError("Duplicate candidate or holdout tasks")
-    if not holdout or set(candidate_ids) & set(holdout_ids):
-        raise ValueError("Holdout must be nonempty and disjoint from candidates")
+    track = getattr(episode, "track", "prediction")
+    if track not in ("prediction", "preference"):
+        raise ValueError("Unknown evaluation track")
+    if set(candidate_ids) & set(holdout_ids) or (track == "prediction" and not holdout):
+        raise ValueError("Prediction holdout must be nonempty and disjoint from candidates")
+    if track == "preference" and holdout:
+        raise ValueError("Preference collection must not reserve prediction tasks")
     if len(set(initial_ids)) != len(initial) or not set(initial_ids) <= set(candidate_ids):
         raise ValueError("Initial tasks must be unique candidate tasks")
     candidate_map = {t.task_id: t for t in candidates}
@@ -100,9 +107,11 @@ def run_episode(
         raise ValueError("Initial task attributes differ from the candidate catalog")
     if any(t.context != context for t in candidates + holdout):
         raise ValueError("Episode contains tasks from another context")
-    requested = tuple(sorted(set(getattr(episode, "budgets", (3, 5, 7, 9)) if budgets is None else budgets)))
+    requested = tuple(sorted(set(episode.budgets if budgets is None else budgets)))
     if not requested or any(not isinstance(b, (int, np.integer)) or b < 0 or b > len(candidates) for b in requested):
         raise ValueError("Budgets must be integers between zero and candidate count")
+    if any(0 < b < len(initial) for b in requested):
+        raise ValueError("A positive budget must include all initial questions")
     rng = np.random.default_rng(episode_seed(seed, profile.uuid, context))
     state = predictor.reset(profile, context)
     common_state = common_predictor.reset(profile, context) if common_predictor is not None else None
@@ -120,18 +129,18 @@ def run_episode(
         if current_budget not in requested:
             return
         before = perf_counter()
-        native = _probability_rows(predictor.predict(state, holdout), len(holdout))
+        native = _probability_rows(predictor.predict(state, holdout), len(holdout)) if holdout else ()
         prediction_seconds = perf_counter() - before
         common = None
         common_prediction_seconds = 0.0
-        if common_predictor is not None:
+        if common_predictor is not None and holdout:
             before = perf_counter()
             common = _probability_rows(common_predictor.predict(common_state, holdout), len(holdout))
             common_prediction_seconds = perf_counter() - before
         checkpoints.append(Checkpoint(profile.uuid, context, scenario, policy_name,
                                       current_budget, holdout_ids,
                                       tuple(o.task.task_id for o in state.history), native, common,
-                                      prediction_seconds, common_prediction_seconds))
+                                      prediction_seconds, common_prediction_seconds, track))
 
     save_checkpoint()
     for step in range(1, max(requested) + 1):
@@ -167,7 +176,7 @@ def run_episode(
         trace.append(StepTrace(profile.uuid, context, scenario, policy_name, step,
                                task.task_id, int(choice), is_initial,
                                tuple(t.task_id for t in remaining), scores,
-                               selection_seconds, update_seconds))
+                               selection_seconds, update_seconds, track))
         save_checkpoint()
     return EpisodeResult(tuple(checkpoints), tuple(trace), state.history)
 

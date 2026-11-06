@@ -7,7 +7,6 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from .acquisition import entropy, validate_candidates, weighted_js_scores
-from .baselines import greedy_fisher_rankings
 from .schema import Predictor, Selection, SurveyState, Task, checked_probabilities
 
 

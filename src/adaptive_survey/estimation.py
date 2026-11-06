@@ -226,8 +226,11 @@ def fit_selected_vs_full(
     selected_records: Iterable[ChoiceRecord], full_records: Iterable[ChoiceRecord], **fit_options,
 ) -> dict:
     """Compare subsets only against the same UUID/context population."""
-    selected = tuple(selected_records)
-    full = tuple(full_records)
+    # At full budget every policy supplies the same observations. Canonical
+    # ordering also gives the optimizer identical floating-point summations.
+    key = lambda record: (record.profile.uuid, record.task.context, record.task.task_id)
+    selected = tuple(sorted(selected_records, key=key))
+    full = tuple(sorted(full_records, key=key))
     if {(r.profile.uuid, r.task.context) for r in selected} != {(r.profile.uuid, r.task.context) for r in full}:
         raise ValueError("Subset and reference need identical UUID/context populations")
     lookup = {(r.profile.uuid, r.task.task_id): r for r in full}

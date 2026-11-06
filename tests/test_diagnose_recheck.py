@@ -29,7 +29,7 @@ def completed_runs(tmp_path):
     paths = generate_demo(tmp_path / "data", n_respondents=7, seed=19)
     bundle = load_bundle(paths["profiles"], paths["tasks"], paths["responses"])
     ids = sorted(bundle.profiles)
-    protocol = ProtocolConfig()
+    protocol = ProtocolConfig(initial_per_block=1, budgets=(3, 5, 7, 9))
     split = {"schema_version": 1, "uuids": {"train": ids[:2], "validation": ids[2:4], "test": ids[4:]},
              "protocol": asdict(protocol),
              "fingerprints": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths.values()}}

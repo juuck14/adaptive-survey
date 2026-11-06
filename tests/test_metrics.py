@@ -48,6 +48,7 @@ def test_paired_uuid_bootstrap_retains_all_contexts_per_respondent():
 
 
 def test_budget_average_requires_the_prespecified_budgets():
-    assert budget_average({3: 1, 5: 2, 7: 3, 9: 4}) == 2.5
+    assert budget_average({6: 1, 9: 2, 12: 3}) == 2
+    assert budget_average({3: 1, 5: 2, 7: 3, 9: 4}, budgets=(3, 5, 7, 9)) == 2.5
     with pytest.raises(ValueError):
         budget_average({3: 1})

@@ -9,6 +9,10 @@ from typing import Iterable, Mapping, Sequence
 from .schema import CONTEXT_BLOCKS, Profile, Task
 
 
+DEFAULT_BUDGETS = (6, 9, 12, 15, 18)
+TRACKS = ("prediction", "preference")
+
+
 def stable_hash(seed: int, *parts: object) -> str:
     return hashlib.sha256(json.dumps([int(seed), *parts], ensure_ascii=True,
                                      separators=(",", ":")).encode()).hexdigest()
@@ -17,8 +21,8 @@ def stable_hash(seed: int, *parts: object) -> str:
 @dataclass(frozen=True)
 class ProtocolConfig:
     holdout_per_block: int = 2
-    initial_per_block: int = 1
-    budgets: tuple[int, ...] = (3, 5, 7, 9)
+    initial_per_block: int = 2
+    budgets: tuple[int, ...] = DEFAULT_BUDGETS
     seed: int = 2026
 
     def __post_init__(self) -> None:
@@ -31,11 +35,17 @@ class ProtocolConfig:
             raise ValueError("Initial questions exceed the acquisition pool")
         if not self.budgets or len(set(self.budgets)) != len(self.budgets):
             raise ValueError("Budgets must be nonempty and unique")
-        available = 2 * (9 - self.holdout_per_block)
         initial = 2 * self.initial_per_block
-        if any(type(b) is not int or b < 0 or b > available or (0 < b < initial)
+        if any(type(b) is not int or b < 0 or b > 18 or (0 < b < initial)
                for b in self.budgets):
-            raise ValueError("Budget must be zero or include all initial questions")
+            raise ValueError("Budget must be at most eighteen and include all initial questions, or be zero")
+
+    def budgets_for(self, track: str) -> tuple[int, ...]:
+        """Prediction reserves labels; preference collection can use all tasks."""
+        if track not in TRACKS:
+            raise ValueError(f"Unknown evaluation track: {track}")
+        available = 18 - 2 * self.holdout_per_block if track == "prediction" else 18
+        return tuple(sorted(b for b in self.budgets if b <= available))
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,7 @@ class Episode:
     initial: tuple[Task, ...]
     candidates: tuple[Task, ...]
     budgets: tuple[int, ...]
+    track: str = "prediction"
 
     @property
     def acquisition_ids(self) -> frozenset[str]:
@@ -72,14 +83,21 @@ def split_uuids(uuids: Iterable[str], train_size: int, val_size: int,
 def make_episode(profile_or_uuid: Profile | str, context: str,
                  tasks: Mapping[str, Task] | Sequence[Task],
                  config: ProtocolConfig = ProtocolConfig(), *,
-                 fixed_rank: Sequence[str] | None = None) -> Episode:
+                 fixed_rank: Sequence[str] | None = None,
+                 track: str = "prediction") -> Episode:
     """Select held-out tasks without inspecting any answer or model prediction.
 
     The default initial-task ranking uses task IDs and protocol seed only; it is
     fixed across people before removing their held-out tasks.  A predeclared
     training-only ranking may be supplied through ``fixed_rank``.
-    ``candidates`` includes the initial questions, totaling fourteen by default.
+    Prediction has fourteen candidates and four protected tasks by default.
+    Preference collection has eighteen candidates and no prediction targets.
+    Initial questions count toward each budget. Infeasible prediction budgets
+    are explicitly reported by the CLI rather than scored on observed labels.
     """
+    budgets = config.budgets_for(track)
+    if not budgets:
+        raise ValueError(f"No feasible budgets for the {track} track")
     uuid = profile_or_uuid.uuid if isinstance(profile_or_uuid, Profile) else profile_or_uuid
     if not isinstance(uuid, str) or not uuid or context not in CONTEXT_BLOCKS:
         raise ValueError("Episode needs a valid UUID and context")
@@ -106,7 +124,7 @@ def make_episode(profile_or_uuid: Profile | str, context: str,
         block_pool = [task for task in pool if task.block == block]
         held = sorted(block_pool,
                       key=lambda task: (stable_hash(config.seed, "holdout", uuid, context,
-                                                    task.task_id), task.task_id))[:config.holdout_per_block]
+                                                    task.task_id), task.task_id))[:config.holdout_per_block if track == "prediction" else 0]
         holdout.extend(held)
         held_ids = {task.task_id for task in held}
         remaining = [task for task in block_pool if task.task_id not in held_ids]
@@ -118,4 +136,4 @@ def make_episode(profile_or_uuid: Profile | str, context: str,
     key = lambda task: (task.block, task.cset, task.task_id)
     return Episode(uuid, context, tuple(sorted(holdout, key=key)), tuple(initial),
                    tuple(sorted((task for task in pool if task.task_id not in held_ids), key=key)),
-                   tuple(sorted(config.budgets)))
+                   budgets, track)

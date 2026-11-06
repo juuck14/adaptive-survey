@@ -2,7 +2,7 @@
 
 합성 응답자에게 같은 수의 SP 질문을 제시하고, 질문 선택 정책과 선택확률 예측기를 분리해서 비교하는 Python 패키지입니다.
 
-현재 구현은 **공통 평가 파이프라인과 Non-graph**입니다. Bayesian/GNN 모델 자체를 대신 구현한 것으로 표시하지 않습니다. 두 방법은 같은 `Predictor`/`Policy` 인터페이스로 연결할 수 있습니다.
+기본 비교는 **Fixed efficient design과 Non-graph adaptive selection**입니다. 두 방법은 같은 동결 Choice learner에 서로 다른 질문 선택 규칙을 적용합니다. Bayesian/GNN은 추후 같은 `Predictor`/`Policy` 인터페이스로 연결할 수 있습니다.
 
 ## 설치
 
@@ -67,32 +67,43 @@ python -m adaptive_survey evaluate --data data/real --split outputs/real-split.j
 | 항목 | 기본값 |
 |---|---|
 | 문항은행 | 54개, Context마다 18개 |
-| 평가 holdout | 블록마다 2개, 총 4개 |
-| 질문 후보 | 나머지 14개 |
-| 초기 공통 질문 | 블록마다 1개, 총 2개 |
-| 질문 예산 | 초기 질문 포함 3·5·7·9개 |
-| 정책 | Fixed, Random, predictive entropy, weighted JS |
+| 초기 공통 질문 | 블록마다 2개, 총 4개 |
+| 총 질문 예산 | 6·9·12·15·18개, 초기 4개 포함 |
+| 기본 비교 | Fixed efficient / Non-graph adaptive (`fixed` / `weighted_js`) |
 | 지표 | NLL, accuracy, Brier, Context macro, paired UUID bootstrap |
 
-하나의 trajectory에서 예산별 checkpoint를 저장합니다. holdout은 질문 선택·가상 답변 참조·개인 상태 갱신에서 제외합니다. Context마다 개인 상태를 초기화하고 다른 평가 응답자의 답변은 공유하지 않습니다. 선택한 generator scenario의 응답 하나만 공개합니다.
+예산은 **응답자 한 명의 Context 하나**에 적용합니다. 예산 6은 초기 4문항을 받은 뒤 2문항을 더 받는 조건입니다. 세 Context 사이에서는 이력을 초기화합니다.
+
+`evaluate`는 목적이 다른 두 설문 경로를 별도로 실행합니다. 각 경로 안에서 두 방법의 초기 문항·후보·생성 응답이 같습니다.
+
+| 실행 경로 | 질문 후보 | 평가용 holdout | 예산 | 산출물 |
+|---|---:|---:|---|---|
+| `prediction` | 14개 | 블록마다 2개, 총 4개 | 6·9·12 | 숨긴 4문항의 NLL·accuracy·Brier |
+| `preference` | 18개 | 없음 | 6·9·12·15·18 | 수집 응답과 공통 MNL의 전체 응답 대비 계수 일치도 |
+
+18개 중 4개를 숨긴 채 18개를 질문할 수는 없습니다. 예산 15·18의 holdout 예측은 계산하지 않으며, `summary.json`의 `unavailable_budgets`에 남깁니다. 한 경로의 예산별 이력은 같은 trajectory의 prefix입니다. 다른 경로의 응답이나 다른 평가 응답자의 상태를 공유하지 않습니다.
 
 ```bash
-# 작은 경계 검사: 같은 공통 예측기에 0·2·14개 이력을 제공할 때 확인
-python -m adaptive_survey evaluate --data data/demo --split outputs/demo-split.json --checkpoint checkpoints/demo.pt --output outputs/boundaries --limit 3 --budgets 0 2 14
+# 진단: 초기 문항 전, 초기 4문항 후, 후보 14문항 전부를 받은 상태
+python -m adaptive_survey evaluate --data data/demo --split outputs/demo-split.json --checkpoint checkpoints/demo.pt --output outputs/boundaries --limit 3 --tracks prediction --budgets 0 4 14
 ```
 
-Fixed는 train 응답으로 추정한 MNL Fisher information의 greedy 순위를 사전에 계산한 뒤 holdout·이미 제시한 질문을 제거합니다. **원래 9문항 efficient block이나 현재 가용 pool의 전역 최적 설계와 동일하지 않습니다.** rank reduction과 고정 순위는 결과에 기록됩니다.
+Fixed는 train 응답으로 MNL을 추정한 뒤 train 프로필 분포에서 문항별 예상 Fisher 정보를 평균합니다. 공통 초기 4문항의 정보를 먼저 더하고, 실제 후보 집합에서 정규화된 Fisher 행렬의 log-determinant를 가장 크게 늘리는 문항을 차례로 넣습니다. 전체 순서는 test 답변을 읽기 전에 확정합니다. 가용 후보와 초기 문항을 계획에 반영하므로, 전역 순위를 만든 뒤 holdout을 지우는 기존 방식과 결과가 다를 수 있습니다.
+
+18개 문항은행 안에서 길이별 고정 prefix를 구성하는 **정규화된 local D-optimal greedy 설계**입니다. 식별 가능한 정보 방향, ridge, train 프로필 표본 수, 고정 순서와 prefix별 log-determinant를 기록합니다. 원래 9문항 블록이나 전역 최적해와의 관계는 [설계 문서](docs/DESIGN.md)에 설명했습니다.
 
 ## 결과와 비교
 
 `evaluate`는 아래 파일을 생성합니다.
 
-- `traces.jsonl`: 선택한 문항·공개 응답·후보·획득 점수·선택/갱신 시간
-- `predictions.jsonl`: 보호된 문항에 대한 예측확률, 정답은 미포함
+- `traces.jsonl`: 실행 경로, 선택 문항·공개 응답·후보·획득 점수·선택/갱신 시간
+- `predictions.jsonl`: prediction 경로의 보호된 문항에 대한 예측확률, 정답은 미포함
+- `collections.jsonl`: preference 경로의 예산별 수집 문항, 예측 점수는 미포함
+- `fixed-plans.json`: test 응답 공개 전 계획한 Fixed 순서와 prefix별 설계 기준값
 - `scores.json`: evaluator가 계산한 응답자별 점수
-- `summary.json`: Context/예산별 결과, 예산 평균 NLL, Random 대비 UUID 단위 paired CI, seed·파일 hash·Fixed prior·계산 시간
+- `summary.json`: 경로별 가능·불가능 예산, Context/예산별 결과, 정책 차이, seed·파일 hash·Fixed prior·계산 시간
 
-같은 learner에 Fixed/Random/Adaptive를 적용한 차이가 질문 선택 효과입니다. 서로 다른 learner의 전체 시스템 차이만으로 adaptive 또는 graph 효과를 주장하지 않습니다. NG/GNN 비교에서는 같은 이력에 대한 예측도 비교해야 합니다.
+Fixed에도 Non-graph와 **같은 checkpoint**를 사용합니다. 학습 자료, 특징, 네트워크, 손실, validation 기준과 평가 중 가중치를 같게 두므로 기본 비교는 문항 선택 규칙의 차이입니다. Fixed가 답변을 읽어 예측을 갱신하더라도 다음 질문의 순서는 바뀌지 않습니다. 주 paired 비교는 `weighted_js − fixed` NLL이며 UUID 단위로 bootstrap합니다. Random/entropy는 `--policies`로 지정하는 보조 진단에 남겨뒀습니다.
 
 별도로 학습한 Non-graph checkpoint를 `--common-checkpoint`로 주면 모든 정책의 수집 이력을 같은 예측기로 읽는 결과도 기록합니다. 같은 파일을 사용했다면 결과의 `common_reader_distinct_checkpoint`가 false입니다. 다른 checkpoint라도 같은 모델 계열이므로 모형 중립적인 정보량을 측정하는 것은 아닙니다.
 
@@ -103,7 +114,7 @@ Fixed는 train 응답으로 추정한 MNL Fisher information의 greedy 순위를
 - 후보 전체 choice set도 52→64→32로 인코딩합니다.
 - 개인 상태, 대안 속성, A/B/C/NONE 라벨, Context, 후보 set embedding을 공유 head에 넣습니다: 84→64→1. 네 효용에 softmax를 적용합니다.
 - 모델당 26,113개 파라미터, 기본 ensemble 5개입니다. Bootstrap 단위는 UUID이며 모든 Context를 함께 재표집합니다.
-- 공개 이력 길이 0..14에서 이력 밖 응답을 감독학습합니다. Target은 이력에 포함하지 않습니다. Validation bank는 고정 seed로 전체 validation cohort에서 섞어 추출하며 실제 포함 인원·범위와 hash를 기록합니다.
+- 하나의 learner가 두 경로의 무작위 부분 이력을 함께 학습합니다. Prediction 경로는 길이 0..14, preference 경로는 0..17이며, 길이가 충분하면 해당 경로의 공통 초기 4문항을 포함합니다. 예측 target은 이력 밖 문항입니다. Prediction holdout은 그 경로의 학습 이력에도 넣지 않습니다. Validation bank는 전체 validation cohort와 두 경로에서 고정 seed로 추출하고 표본 수·경로·hash를 기록합니다.
 - 기본 학습 상한은 120 epochs × 1,024 episodes, batch 64로 모델당 1,920 optimizer updates입니다. Validation 720 episodes와 patience 30으로 선택하고, 선택된 모델과 실제 실행의 update 수를 각각 기록합니다. 짧은 실행은 이력 사용을 거의 학습하지 못할 수 있습니다.
 - 평가 중 가중치는 동결합니다. 실제 또는 가상 답변은 immutable history에 추가되고, 가상 예측은 한 번에 batch 처리합니다.
 
@@ -117,14 +128,14 @@ Weighted JS는 후보 q의 네 가상 답변을 넣었을 때 **다른 남은 �
 
 MMNL은 개인의 지속적인 랜덤 선호를 가지므로 주 개인화 환경입니다. MNL은 프로필 조건부 개인화의 대조 환경입니다. 이력·정책의 실제 효과는 Random 및 profile-only 결과와 비교해야 합니다. 작은 smoke run을 성능 향상의 증거로 보고하지 않습니다.
 
-기존 학습·검증 180/60명을 유지하고 새 응답자 300명, 학습 seed 3개 × ensemble 5개로 재실험했습니다. 같은 모델의 빈 이력→9개 응답 이력에서 NLL은 1.17134→1.12076으로 낮아졌고, 초기 답변만 바꾼 진단에서 다음 문항은 평균 52.22%의 사례에서 달라졌습니다. 예산 평균 JS−Random NLL은 −0.002275였지만 95% CI [−0.005480, +0.000660]이므로 정책 우위를 확정하지 않습니다. [설정·전체 결과·재현 명령](docs/RECHECK.md)을 참고하세요.
+Non-graph 명세와 현재 네트워크의 대응 관계는 [설계 문서](docs/DESIGN.md#non-graph-specification)를 참고하세요. [이전 개발 실행 기록](docs/RECHECK.md)은 초기 2문항·예산 3·5·7·9를 사용한 과거 버전의 기록입니다. 현재 기본 설정의 실험 결과로 사용하지 않습니다.
 
 ## 공통 MNL과 대체 예측기
 
-`estimate`는 수집된 응답과 동일 응답자의 전체 18문항 reference를 공통 pooled MNL로 분석합니다. 실제 handoff와 같은 34개 mean-utility feature를 사용하고, reference와 selected fit의 식별 basis를 맞춥니다. 부족한 rank를 조용히 0계수로 채워 복원 성공으로 보고하지 않습니다.
+`estimate`는 기본적으로 **preference 경로**의 수집 응답과 동일 응답자의 전체 18문항 reference를 공통 pooled MNL로 분석합니다. 실제 handoff와 같은 34개 mean-utility feature를 사용하고, reference와 selected fit의 식별 basis를 맞춥니다. 부족한 rank를 조용히 0계수로 채워 복원 성공으로 보고하지 않습니다. 예산 18에서는 두 방법이 같은 응답 전체를 수집하므로 reference와 일치해야 합니다.
 
 ```bash
-python -m adaptive_survey estimate --data data/real --split outputs/real-split.json --evaluation outputs/real-evaluation --output outputs/population.json --policies random weighted_js --budgets 3 9 --cluster-se
+python -m adaptive_survey estimate --data data/real --split outputs/real-split.json --evaluation outputs/real-evaluation --output outputs/population.json --cluster-se
 ```
 
 MMNL 응답에 대한 pooled MNL은 reference agreement입니다. 정책별 문항 분포와 모형 오명세의 영향을 받으며, 실제 MMNL 평균계수 복원과 같지 않습니다. 모집단 적합은 사후 분석이고 질문 선택에 되돌리지 않습니다.
@@ -154,7 +165,7 @@ MMNL taste는 UUID마다 한 번 뽑아 54문항에서 유지합니다. 응답 �
 | `neural`, `training` | Non-graph, bootstrap ensemble, checkpoint |
 | `acquisition`, `policies` | 가상 답변 JS와 질문 선택 |
 | `runner`, `metrics` | 공통 실행, 예측, 점수, paired CI |
-| `estimation`, `baselines` | 공통 MNL, PanelMAP, train Fisher ranking |
+| `estimation`, `baselines` | 공통 MNL, train Fisher 기반 Fixed 설계, 보조 PanelMAP |
 | `generator`, `demo`, `cli` | 외부 handoff, 가상 개발자료, 실행 명령 |
 
 GNN/Bayesian native 모델, rollout 이력 보강, 명시적 개인 latent posterior, 자동 hyperparameter bank 실행은 별도 확장입니다. 현재는 hyperparameter를 CLI로 지정해 validation에서 선택할 수 있습니다. [설계·정보 경계](docs/DESIGN.md)와 [실행 검증 기록](docs/VALIDATION.md)을 참고하세요.

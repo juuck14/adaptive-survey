@@ -20,15 +20,15 @@ def test_context_episode_has_balanced_disjoint_pools_and_initial_subset(tasks, c
     episode = make_episode("person", context, tasks)
     assert len(episode.holdout) == 4
     assert len(episode.candidates) == 14
-    assert len(episode.initial) == 2
+    assert len(episode.initial) == 4
     assert Counter(task.block for task in episode.holdout) == dict.fromkeys(CONTEXT_BLOCKS[context], 2)
-    assert Counter(task.block for task in episode.initial) == dict.fromkeys(CONTEXT_BLOCKS[context], 1)
+    assert Counter(task.block for task in episode.initial) == dict.fromkeys(CONTEXT_BLOCKS[context], 2)
     held = {task.task_id for task in episode.holdout}
     initial = {task.task_id for task in episode.initial}
     assert held.isdisjoint(episode.acquisition_ids)
     assert initial <= episode.acquisition_ids
     assert len(held | episode.acquisition_ids) == 18
-    assert episode.budgets == (3, 5, 7, 9)
+    assert episode.budgets == (6, 9, 12)
 
 
 def test_protocol_is_input_order_independent_and_ignores_profile_features(tasks):
@@ -46,8 +46,8 @@ def test_predeclared_fixed_ranking_selects_earliest_eligible_in_each_block(tasks
     rank = [task.task_id for task in reversed(list(tasks.values()))]
     episode = make_episode("person", "transfer", tasks, fixed_rank=rank)
     held = {task.task_id for task in episode.holdout}
-    expected = [next(task_id for task_id in rank if task_id.startswith(f"B{block}_") and task_id not in held)
-                for block in CONTEXT_BLOCKS["transfer"]]
+    expected = [task_id for block in CONTEXT_BLOCKS["transfer"]
+                for task_id in [item for item in rank if item.startswith(f"B{block}_") and item not in held][:2]]
     assert [task.task_id for task in episode.initial] == expected
     with pytest.raises(ValueError, match="duplicate"):
         make_episode("person", "transfer", tasks, fixed_rank=rank + rank[:1])
@@ -56,7 +56,7 @@ def test_predeclared_fixed_ranking_selects_earliest_eligible_in_each_block(tasks
 
 
 def test_contexts_are_separate_and_diagnostic_budgets_supported(tasks):
-    config = ProtocolConfig(budgets=(14, 0, 9, 2))
+    config = ProtocolConfig(initial_per_block=1, budgets=(14, 0, 9, 2))
     episodes = [make_episode("person", context, tasks, config) for context in CONTEXTS]
     assert all(episode.budgets == (0, 2, 9, 14) for episode in episodes)
     all_ids = [episode.acquisition_ids | {task.task_id for task in episode.holdout}
@@ -68,11 +68,28 @@ def test_contexts_are_separate_and_diagnostic_budgets_supported(tasks):
                                     {"holdout_per_block": 2.5}, {"initial_per_block": 8},
                                     {"initial_per_block": -1}, {"budgets": ()},
                                     {"budgets": (3, 3)}, {"budgets": (1,)},
-                                    {"budgets": (15,)}, {"budgets": (3.0,)},
+                                    {"budgets": (19,)}, {"budgets": (6.0,)},
                                     {"budgets": (True,)}, {"seed": 2.5}])
 def test_invalid_protocol_configuration_fails_early(kwargs):
     with pytest.raises(ValueError):
         ProtocolConfig(**kwargs)
+
+
+def test_full_pool_collection_keeps_all_requested_budgets_separate_from_prediction(tasks):
+    config = ProtocolConfig()
+    prediction = make_episode("person", "transfer", tasks, config)
+    preference = make_episode("person", "transfer", tasks, config, track="preference")
+    assert config.budgets == (6, 9, 12, 15, 18)
+    assert prediction.track == "prediction" and prediction.budgets == (6, 9, 12)
+    assert preference.track == "preference" and preference.budgets == config.budgets
+    assert not preference.holdout and len(preference.candidates) == 18
+    assert len(preference.initial) == len(prediction.initial) == 4
+    assert Counter(t.block for t in preference.initial) == dict.fromkeys(CONTEXT_BLOCKS["transfer"], 2)
+    only_full = ProtocolConfig(budgets=(18,))
+    assert only_full.budgets_for("prediction") == ()
+    with pytest.raises(ValueError, match="No feasible"):
+        make_episode("person", "transfer", tasks, only_full)
+    assert make_episode("person", "transfer", tasks, only_full, track="preference").budgets == (18,)
 
 
 def test_invalid_context_task_pool_fails(tasks):

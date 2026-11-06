@@ -55,6 +55,12 @@ class ScoredCheckpoint:
 
 def score_checkpoint(checkpoint: Checkpoint, world: Any) -> tuple[ScoredCheckpoint, ...]:
     """Evaluator-only boundary: hidden labels are read here, after rollout."""
+    if checkpoint.track == "preference":
+        if checkpoint.holdout_task_ids or checkpoint.probabilities or checkpoint.common_probabilities:
+            raise ValueError("Preference checkpoints cannot contain held-out predictions")
+        return ()
+    if not checkpoint.holdout_task_ids:
+        raise ValueError("Prediction scoring needs protected, unasked tasks")
     scenario = str(getattr(world, "scenario", checkpoint.scenario))
     if scenario != checkpoint.scenario:
         raise ValueError("Prediction and response-world scenarios differ")
@@ -106,7 +112,7 @@ def context_macro(records: Iterable[ScoredCheckpoint], metric: str = "nll") -> d
             for r in summarize_scores(records) if r["context"] == "macro"}
 
 
-def budget_average(values: Mapping[int, float], budgets: Sequence[int] = (3, 5, 7, 9)) -> float:
+def budget_average(values: Mapping[int, float], budgets: Sequence[int] = (6, 9, 12)) -> float:
     if not budgets or any(b not in values or not np.isfinite(values[b]) for b in budgets):
         raise ValueError("All prespecified budgets need finite scores")
     return float(np.mean([values[b] for b in budgets]))
