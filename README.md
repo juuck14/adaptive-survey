@@ -107,6 +107,8 @@ Fixed에도 Non-graph와 **같은 checkpoint**를 사용합니다. 학습 자료
 
 별도로 학습한 Non-graph checkpoint를 `--common-checkpoint`로 주면 모든 정책의 수집 이력을 같은 예측기로 읽는 결과도 기록합니다. 같은 파일을 사용했다면 결과의 `common_reader_distinct_checkpoint`가 false입니다. 다른 checkpoint라도 같은 모델 계열이므로 모형 중립적인 정보량을 측정하는 것은 아닙니다.
 
+초기 4문항 설정으로 연동 자료의 train 180명·validation 60명·test 300명을 다시 학습·평가했습니다. MNL/MMNL 각각 학습 seed 3개 × ensemble 5개를 사용한 [결과와 재현 명령](docs/RERUN_20261107.md), [집계 JSON](docs/RERUN_20261107.json)을 확인할 수 있습니다.
+
 ## Non-graph
 
 - 전체 문항 속성 52개, Context 3개, 선택 one-hot 4개를 event MLP에 넣습니다: 59→64→64.
