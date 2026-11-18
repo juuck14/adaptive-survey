@@ -1,5 +1,13 @@
 # Adaptive survey
 
+**최종 팀 실험(2026-11-12 전달본)**은 [팀 실행 안내](docs/TEAM_HANDOFF_20261112.md)를 따릅니다.
+`scripts/run_team_handoff.py`는 지정 표본 1,500명 × 10회, 지정 초기 3문항 + 추가 6문항,
+기존 응답은행 재사용, 원래 9문항 블록 Fixed와 팀 제출 CSV를 지원합니다.
+평가 UUID 전체 합집합을 학습·검증에서 제외하며, 최종 계수 추정은 팀의 공통 추정 절차로 진행합니다.
+
+아래의 기존 `demo/train/evaluate/estimate` 명령과 4문항 초기화·여러 예산 결과는
+11월 7일 개발 실험의 재현용입니다. 최종 팀 실험과 설정·평가 기준이 다릅니다.
+
 합성 응답자에게 같은 수의 SP 질문을 제시하고, 질문 선택 정책과 선택확률 예측기를 분리해서 비교하는 Python 패키지입니다.
 
 기본 비교는 **Fixed efficient design과 Non-graph adaptive selection**입니다. 두 방법은 같은 동결 Choice learner에 서로 다른 질문 선택 규칙을 적용합니다. Bayesian/GNN은 추후 같은 `Predictor`/`Policy` 인터페이스로 연결할 수 있습니다.
