@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -76,6 +76,7 @@ def run_episode(
     common_predictor: Predictor | None = None,
     seed: int = 2026,
     budgets: Sequence[int] | None = None,
+    on_step: Callable[[StepTrace], None] | None = None,
 ) -> EpisodeResult:
     """Run one independent UUID/context episode.
 
@@ -177,6 +178,8 @@ def run_episode(
                                task.task_id, int(choice), is_initial,
                                tuple(t.task_id for t in remaining), scores,
                                selection_seconds, update_seconds, track))
+        if on_step is not None:
+            on_step(trace[-1])
         save_checkpoint()
     return EpisodeResult(tuple(checkpoints), tuple(trace), state.history)
 

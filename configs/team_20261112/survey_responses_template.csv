@@ -1,0 +1,1 @@
+﻿sample_id,uuid,context,stratum_id,generation,gender,education,replicate_id,sampling_seed,GEN_Z,GEND_F,GEND_O,GEND_PNO,EDU_1,EDU_2,EDU_3,EDU_5,EDU_6,schema_version,run_id,generator_type,selection_method,survey_instance_id,base_block,task_id,task_block,question_in_block,question_order,phase,chosen_alternative,acquisition_score,selection_time_ms
