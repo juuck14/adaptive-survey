@@ -1,0 +1,121 @@
+% Seojin's report sections. Replace the corresponding sections in the final report.
+\subsection{Research Framework}
+
+We study how question selection affects population preference estimation under
+an equal response budget. Human stated-preference data calibrate the MNL and
+panel MMNL response generators. These generators supply the existing choice
+response bank for Nemotron profiles. A survey method receives the respondent's
+public profile and previously revealed answers, selects an unasked task, and
+receives only that task's stored answer. Repeating this process yields nine
+observations per respondent, including three prescribed initial questions.
+
+The comparison considers fixed efficient design, Bayesian adaptive design,
+non-graph adaptive selection, and graph-based adaptive selection. Respondents,
+context assignments, initial questions, response realizations and question
+budgets are shared across methods. The completed collections described below
+cover Fixed and Non-graph. The final analysis fits a common MNL or panel MMNL
+specification to the collected responses and compares estimable coefficients
+with the corresponding generator parameters. Repeated appearances of a UUID
+across sampling replicates are retained as part of this fixed-bank resampling
+design rather than counted as distinct independent respondents.
+
+\subsection{Question-Selection Methods}
+\subsubsection{Fixed Efficient Design}
+
+Fixed uses the original nine-task efficient-design block: Block 1 for Transfer,
+Block 3 for Layover, and Block 5 for Stopover. Within each block, the prescribed
+three initial tasks are presented first, followed by the remaining six tasks
+in the supplied order. The respondent's answers do not change this sequence.
+This baseline retains the original block's question set.
+
+\subsubsection{Bayesian Adaptive Design}
+
+The Bayesian comparator maintains a preference distribution for each
+respondent, updates it using revealed choices, and selects subsequent tasks
+using its information-based design criterion. The team's proposed
+implementation uses weighted Monte Carlo particles with a Gaussian prior.
+Its population prior, posterior approximation and acquisition settings must be
+reported with that implementation.
+
+\subsubsection{Non-graph Adaptive Question Selection}
+
+The non-graph learner predicts alternative choices from respondent attributes,
+the current survey context, the attributes and revealed answers of previous
+questions, and the attributes of each candidate choice task. A shared event MLP
+encodes each observed question--answer pair. Mean pooling produces an
+order-invariant history representation, which is combined with nine respondent
+covariates, the context, and history-length indicators. A shared utility head
+scores alternatives A, B, C, and NONE, followed by a softmax. Neither respondent
+identifiers nor question identifiers enter the network as features. We average
+the predicted probabilities of five respondent-bootstrap models.
+
+\paragraph{Offline training.}
+We exclude the union of respondents in all ten evaluation replicates from both
+training and validation. The learner uses 1,200 additional respondents for
+training and 300 for validation, with all contexts of a respondent kept in the
+same partition. Training episodes contain between zero and eight observed
+answers; histories of length at least three include the prescribed initial
+questions. The remaining history questions are sampled without replacement.
+We minimize cross-entropy on answers outside the observed history and select
+checkpoints using validation log-loss. Each ensemble member is trained for at
+most 120 epochs with 1,024 episodes per epoch and early-stopping patience 30.
+MNL and panel MMNL responses are used to train separate ensembles. Network
+weights remain fixed throughout the evaluation surveys.
+
+\paragraph{Acquisition rule.}
+Let $h$ denote the revealed history and $\mathcal C$ the remaining candidate
+questions. For a candidate $q$, we consider its four possible answers $a$ and
+their current predicted probabilities $w_a(q)=p_\theta(a\mid q,h)$.
+For another candidate $r$, let $p_r^{q,a}$ be its predicted choice distribution
+after appending the hypothetical observation $(q,a)$ to $h$. We select the
+question maximizing
+\begin{equation}
+\begin{aligned}
+ J(q) &= \frac{1}{|\mathcal C|-1}
+     \sum_{r\in\mathcal C\setminus\{q\}}\left[
+       H\!\left(\sum_a w_a(q)p_r^{q,a}\right)\right.\\[-2pt]
+ &\hspace{35mm}\left.-\sum_a w_a(q)H(p_r^{q,a})\right].
+\end{aligned}
+\end{equation}
+This weighted Jensen--Shannon score measures changes in predictions for other
+remaining questions. Its value is used as a predictive-dependence proxy;
+coefficient recovery is assessed separately by the common final estimator.
+Hypothetical answers never modify the actual respondent history.
+
+\paragraph{Survey collection.}
+Each replicate contains 500 respondents in each of the three contexts. All
+methods use the supplied context assignments and the same three initial
+questions and answers. Non-graph selection then asks six additional questions
+from the fifteen remaining questions in the same context. Fixed selection uses
+the supplied order of the original nine-question block. Answers are read from
+the existing response bank only after a question is selected. The ten
+replicates resample respondents from this fixed bank. All nine revealed answers,
+including the initial three, are retained for the common MNL or panel MMNL
+coefficient-recovery analysis. No prediction holdout is used in this experiment.
+
+\subsubsection{Graph-Based Adaptive Selection}
+
+The graph comparator represents respondents and question--alternative pairs
+as nodes connected by observed response relations. Message passing shares
+response information across connected nodes before predicting choices.
+The documented comparison uses the same weighted JS acquisition strategy as
+Non-graph. A controlled comparison matches the available profile and task
+information, revealed-history restrictions, choice-prediction objective and
+data partitions. The team's preliminary graph study selected LightGCN and
+examined different propagation depths; final architecture and masking details
+belong to the graph implementation description.
+
+\subsection{Completed Survey Collections}
+
+For each of ten supplied replicates, Fixed and Non-graph collected nine
+answers from 500 respondents in each of three contexts under each generator.
+This produced 40 response files and 540,000 respondent--task observations.
+All files passed the supplied schema and survey validator. Additional checks
+matched the original cohort fields and stored response-bank answers,
+verified the prescribed initial sequence and context quotas, and confirmed
+that no evaluation UUID entered Non-graph training or validation.
+
+These are the collected response sets for the shared final estimator.
+Coefficient-recovery results will report bias and RMSE for the estimable mean
+coefficients and, for panel MMNL, the random-coefficient standard deviations.
+The population estimator and normalization must be common across methods.
